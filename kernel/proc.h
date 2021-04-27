@@ -94,9 +94,11 @@ struct proc {
   int pid;                              // Process ID
   uint pending_signals;                 // Pending signals
   uint sig_mask;                        // Signal masks
+  uint prev_sig_mask;                   // Holds process sigmask while process is running a signal handler
   void* sig_handlers[NSIGS];            // Signal handlers
   uint sig_handlers_masks[NSIGS];       // Masks for each signal handler
   struct trapframe *user_trap_backup;   // Backup of user trapframe
+  int in_signal_handler;                // Flag to indicate whether the process is handling a signal and needs to block handling other signals
 
   // proc_tree_lock must be held when using this:
   struct proc *parent;         // Parent process

@@ -20,6 +20,9 @@ static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
 
+extern void* sig_ret_start(void);
+extern void* sig_ret_end(void);
+
 // helps ensure that wakeups of wait()ing
 // parents are not lost. helps obey the
 // memory model when using p->parent.
@@ -317,6 +320,7 @@ fork(void)
   int sig;
   for(sig = 0; sig < NSIGS; sig++) {
     np->sig_handlers[sig] = p->sig_handlers[sig];
+    np->sig_handlers_masks[sig] = p->sig_handlers_masks[sig];
   }
 
   release(&np->lock);
@@ -593,13 +597,14 @@ int
 kill(int pid, int signum)
 {
   struct proc *p;
-
   for(p = proc; p < &proc[NPROC]; p++){
     acquire(&p->lock);
     if(p->pid == pid){
       
-      if(p->state == ZOMBIE || p->state == UNUSED)
+      if(p->state == ZOMBIE || p->state == UNUSED) {
+        release(&p->lock);
         return -1;
+      }
       
       p->pending_signals = (p->pending_signals | (1 << signum));
       
@@ -674,88 +679,111 @@ uint
 sigprocmask(uint sigmask)
 {
   struct proc *p = myproc();
+  acquire(&p->lock);
   uint old_sig_mask = p->sig_mask;
   p->sig_mask = sigmask;
+  release(&p->lock);
   return old_sig_mask;
 }
 
 int 
-sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
+sigaction(int signum, uint64 act, uint64 oldact)
 {
   struct proc *p = myproc();
 
   // check if signum is legal, act is not null and we're not trying to modify sigkill or sigstop
-  if(signum < 0 || signum > NSIGS || signum == SIGKILL || signum == SIGSTOP || !act)
+  if(signum < 0 || signum > NSIGS || signum == SIGKILL || signum == SIGSTOP)
     return -1;
   
-  // check that the new mask is not blocking sigkill or sigstop
-  if((((1 << SIGKILL) & act->sigmask) != 0) || (((1 << SIGSTOP) & act->sigmask) != 0))
-    return -1;
+  acquire(&p->lock);
 
-  if(oldact){
-    oldact->sa_handler = p->sig_handlers[signum];
-    oldact->sigmask = p->sig_handlers_masks[signum];
+  if (oldact) {
+    copyout(p->pagetable, oldact, (char*)&p->sig_handlers[signum], sizeof(p->sig_handlers[signum]));
+    copyout(p->pagetable, oldact + sizeof(p->sig_handlers[signum]), (char*)&p->sig_handlers_masks[signum], sizeof(uint));
   }
 
-  p->sig_handlers[signum] = act->sa_handler;
-  p->sig_handlers_masks[signum] = act->sigmask;
+  struct sigaction temp;
+  if(act && copyin(p->pagetable, (char*)&temp, act, sizeof(struct sigaction)) >= 0) {
+    // check that the new mask is not blocking sigkill or sigstop
+    if((((1 << SIGKILL) & temp.sigmask) != 0) || (((1 << SIGSTOP) & temp.sigmask) != 0)) {
+      release(&p->lock);
+      return -1;
+    }
 
+    p->sig_handlers[signum] = temp.sa_handler;
+    p->sig_handlers_masks[signum] = temp.sigmask;
+  }
+
+  release(&p->lock);
   return 0;
 }
 
 void
 sigret(void)
 {
-  //TODOOOOOOOOOOOOOOOOOOOOOOO
   struct proc *p = myproc();
+  acquire(&p->lock);
+  // Restore the process original trapframe
   memmove(p->trapframe, p->user_trap_backup, sizeof(struct trapframe));
+  // Restore the process original signal mask
+  p->sig_mask = p->prev_sig_mask;
+  // Turn off the flag indicates a user space signal handling for blocking incoming signals at this time.
+  p->in_signal_handler = 0;
+  release(&p->lock);
 }
 
 void
 sigkill_handler()
 {
   struct proc *p = myproc();
+  acquire(&p->lock);
   p->killed = 1;
   if(p->state == SLEEPING){
     // Wake process from sleep().
     p->state = RUNNABLE;
   }
+  release(&p->lock);
 }
 
 void
 sigcont_handler()
 {
   struct proc *p = myproc();
- 
+  acquire(&p->lock);
+
  // If no SIGSTOP in pending signals turn off cont signal bit
-  if (!((1 << SIGSTOP) & p->pending_signals))
-    p->pending_signals = p->pending_signals & !(1 << SIGCONT); 
+  if (((1 << SIGSTOP) & p->pending_signals) == 0)
+    p->pending_signals = p->pending_signals & !(1 << SIGCONT);
+  
+  release(&p->lock);
 }
 
 void
 sigstop_handler()
 {
   struct proc *p = myproc();
+  acquire(&p->lock);
   while(1){
-    if(p->pending_signals & (1 << SIGCONT))
-      break;
-    else
+    if (!(p->pending_signals & (1 << SIGCONT)))
       yield();
-  }
-  // Turn off signal bit in pending signals
-  p->pending_signals = p->pending_signals & !(1 << SIGSTOP);
-  p->pending_signals = p->pending_signals & !(1 << SIGCONT);
+  }p->pending_signals = p->pending_signals & !(1 << SIGCONT);
+  release(&p->lock);
 }
 
 void
-handle_signals() 
+handle_signals()
 {  
+  //TODO: check if we need to signal by priority
   struct proc *p = myproc();
+  if (p->in_signal_handler)
+    return;
   for(int i=0; i<NSIGS; i++){
     int curr_sig = 1 << i;
     if((curr_sig & p->pending_signals) && !(curr_sig & p->sig_mask)){
-      if (p->sig_handlers[i] == (void*)SIG_IGN)
+      if (p->sig_handlers[i] == (void*)SIG_IGN) {
+        p->pending_signals = p->pending_signals & !curr_sig;
         continue;
+      }
       if (p->sig_handlers[i] == (void*)SIG_DFL){
         switch(i){
           case SIGKILL:
@@ -772,14 +800,35 @@ handle_signals()
             break;
         }
       }
-      else {
+      else { 
+        // backup current process mask
+        p->prev_sig_mask = p->sig_mask;
+        // replace process mask with signal mask
+        p->sig_mask = p->sig_handlers_masks[i];
+        // disable handling other signals
+        p->in_signal_handler = 1;
+        // backup user trapframe
         memmove(p->user_trap_backup, p->trapframe, sizeof(struct trapframe));
-        // update SP to user handler pointer
-        // update return address of user handler to sigret
-        // before executing user handler (jump to code), replace process mask with signal mask
-        // TOTHINK: at the end of signal handler (maybe sigret) change back process mask to signal mask (which contains prev process mask)
-
-        // TODO: meaning of - "creating an explicit call to sigret in the user stack, and pointing the return address of the signal handler to the sigret call."
+        // set pc to signal handler 
+        p->trapframe->epc = (uint64)p->sig_handlers[i];
+        // calculate sigret function size
+        uint sig_ret_size = sig_ret_end - sig_ret_start;
+        // allocate space for sigret function
+        p->trapframe->sp -= sig_ret_size;
+        // move sigret to stack
+        memmove((void*)p->trapframe->sp, &sig_ret_start, sizeof(sig_ret_size));
+        // pointer to sigret function in stack
+        void* sig_ret_addr = (void*)p->trapframe->sp;
+        // allocate space for signum 
+        p->trapframe->sp -= sizeof(int);
+        // move signum to stack
+        memmove((void*)p->trapframe->sp, &i, sizeof(int));
+        // allocate space for return address
+        p->trapframe->sp -= sizeof(int);
+        // move ret addr to stack
+        memmove((void*)p->trapframe->sp, &sig_ret_addr, sizeof(int));
+        // turn off signal bit
+        p->pending_signals = p->pending_signals & !curr_sig;
       }
     }
   }

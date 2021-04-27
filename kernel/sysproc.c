@@ -114,15 +114,15 @@ uint64
 sys_sigaction(void)
 {
   int signum;
-  const struct sigaction* sig_action;
-  struct sigaction* oldact;
+  uint64 act;
+  uint64 old;
 
   if(argint(0, &signum) < 0)
     return -1;
-  argaddr(1, (void*)&sig_action);
-  argaddr(2, (void*)&oldact);
+  argaddr(1, &act);
+  argaddr(2, &old);
 
-  return sigaction(signum, sig_action, oldact);
+  return sigaction(signum, act, old);
 }
 
 uint64
@@ -135,24 +135,24 @@ sys_sigret(void)
 uint64
 sys_bsem_alloc(void)
 {
-
+  return 0;
 }
 
 uint64
 sys_bsem_free(void)
 {
-
+  return 0;
 }
 
 uint64
 sys_bsem_down(void)
 {
-
+  return 0;
 }
 
 uint64
 sys_bsem_up(void)
 {
-
+  return 0;
 }
 

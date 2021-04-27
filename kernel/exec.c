@@ -120,6 +120,7 @@ exec(char *path, char **argv)
   for(sig = 0; sig < NSIGS; sig++) {
     if(p->sig_handlers[sig] != (void*)SIG_DFL && p->sig_handlers[sig] != (void*)SIG_IGN)
         p->sig_handlers[sig] = (void*)SIG_DFL;
+    p->sig_handlers_masks[sig] = 0; //TODO :: init all signals or not
   }
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
